@@ -1,8 +1,140 @@
 {
 	"queries": [
 		{
-			"name": "Computers with Specified IP (change as required)",
-			"category": "SCCMHound",
+			"name": "All SCCM Sites and Their Infrastructure",
+			"category": "SCCMHound - Infrastructure",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (s:SCCMSite) OPTIONAL MATCH (ss)-[:SCCMSiteServerFor]->(s) OPTIONAL MATCH (mp)-[:SCCMManagementPointFor]->(s) OPTIONAL MATCH (dp)-[:SCCMDistributionPointFor]->(s) OPTIONAL MATCH (db)-[:SCCMDBServerFor]->(s) RETURN s, ss, mp, dp, db",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "SCCM Site Servers",
+			"category": "SCCMHound - Infrastructure",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (c)-[:SCCMSiteServerFor]->(s:SCCMSite) RETURN c, s",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "SCCM Management Points",
+			"category": "SCCMHound - Infrastructure",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (c)-[:SCCMManagementPointFor]->(s:SCCMSite) RETURN c, s",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "SCCM PXE Distribution Points (CRED-1 risk)",
+			"category": "SCCMHound - Attack Paths",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (c)-[r:SCCMDistributionPointFor]->(s:SCCMSite) WHERE r.pxe_enabled = true RETURN c, s",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "SCCM Database Servers",
+			"category": "SCCMHound - Infrastructure",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (c)-[:SCCMDBServerFor]->(s:SCCMSite) RETURN c, s",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "TAKEOVER-1: DB Servers Relayable via MSSQL (EPA not enforced)",
+			"category": "SCCMHound - Attack Paths",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (s:SCCMSite)-[r:SCCMRelayTarget]->(db) WHERE r.epa_enforced = false RETURN s, r, db",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "TAKEOVER-2: DB Servers Relayable via SMB (signing not required)",
+			"category": "SCCMHound - Attack Paths",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (s:SCCMSite)-[r:SCCMRelayTarget]->(db) WHERE r.smb_signing_required = false RETURN s, r, db",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "EXEC-1/EXEC-2: All Computers Manageable by SCCM Site (RCE path)",
+			"category": "SCCMHound - Attack Paths",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (s:SCCMSite)-[:SCCMManages]->(c:Computer) RETURN s, c LIMIT 500",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "Shortest Path to SCCM Site Server via Sessions/AdminTo",
+			"category": "SCCMHound - Attack Paths",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (ss)-[:SCCMSiteServerFor]->(s:SCCMSite) WITH ss MATCH p=shortestPath((n)-[:MemberOf|HasSession|AdminTo*1..]->(ss)) WHERE NOT n=ss RETURN p",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "Shortest Path from SCCM Site to Domain Admins",
+			"category": "SCCMHound - Attack Paths",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (ss)-[:SCCMSiteServerFor]->(s:SCCMSite) WITH ss MATCH p=shortestPath((ss)-[:MemberOf|HasSession|AdminTo|SCCMManages*1..]->(da:Group)) WHERE da.name CONTAINS 'DOMAIN ADMINS' RETURN p",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "Users with Sessions on SCCM-Managed Computers",
+			"category": "SCCMHound - Recon",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (s:SCCMSite)-[:SCCMManages]->(c:Computer) MATCH (u:User)-[:HasSession]->(c) RETURN u, c, s LIMIT 500",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "Local Admins on SCCM-Managed Computers",
+			"category": "SCCMHound - Recon",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (s:SCCMSite)-[:SCCMManages]->(c:Computer) MATCH (u)-[:AdminTo]->(c) RETURN u, c, s LIMIT 500",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "Computers with Specified IP (change 10.0.0 as required)",
+			"category": "SCCMHound - Recon",
 			"queryList": [
 				{
 					"final": true,
@@ -13,7 +145,7 @@
 		},
 		{
 			"name": "Computers with Unresolvable Sessions",
-			"category": "SCCMHound",
+			"category": "SCCMHound - Recon",
 			"queryList": [
 				{
 					"final": true,
@@ -23,12 +155,23 @@
 			]
 		},
 		{
-			"name": "Shortest Paths (MemberOf|HasSession|AdminTo)",
-			"category": "SCCMHound",
+			"name": "Shortest Paths via SCCM (MemberOf|HasSession|AdminTo|SCCMManages)",
+			"category": "SCCMHound - Attack Paths",
 			"queryList": [
 				{
 					"final": true,
-					"query": "MATCH p=shortestPath((n)-[:MemberOf|HasSession|AdminTo*1..]->(m:Group)) WHERE m.name CONTAINS 'DOMAIN ADMINS' AND NOT n=m RETURN p",
+					"query": "MATCH p=shortestPath((n)-[:MemberOf|HasSession|AdminTo|SCCMManages*1..]->(m:Group)) WHERE m.name CONTAINS 'DOMAIN ADMINS' AND NOT n=m RETURN p",
+					"allowCollapse": true
+				}
+			]
+		},
+		{
+			"name": "Full SCCM Attack Path: User to RCE on Any Managed Computer",
+			"category": "SCCMHound - Attack Paths",
+			"queryList": [
+				{
+					"final": true,
+					"query": "MATCH (ss)-[:SCCMSiteServerFor]->(s:SCCMSite)-[:SCCMManages]->(target:Computer) MATCH p=shortestPath((attacker:User)-[:MemberOf|HasSession|AdminTo*1..]->(ss)) WHERE NOT attacker = ss RETURN p, s, target LIMIT 50",
 					"allowCollapse": true
 				}
 			]

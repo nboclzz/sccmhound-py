@@ -90,10 +90,12 @@ def invoke(config: Config) -> None:
     from sccmhound.collectors.wmi_collector import WMICollector
     from sccmhound.connectors.adminservice import AdminServiceConnector
     from sccmhound.connectors.wmi import WMIConnector
-    from sccmhound.discovery.ldap_discovery import discover_sccm
+    from sccmhound.discovery.ldap_discovery import SCCMInfrastructure, discover_sccm
+    from sccmhound.discovery.smb_probes import check_smb_signing, probe_site_server
     from sccmhound.ldap.connection_manager import LdapConnectionManager
     from sccmhound.ldap.sid_resolver import SIDResolver
     from sccmhound.output import json_writer
+    from sccmhound.output.opengraph_writer import write_opengraph
     from sccmhound.resolvers.domains import resolve_domains
     from sccmhound.resolvers.local_admins import resolve_local_admins
     from sccmhound.resolvers.sessions import resolve_sessions
@@ -103,6 +105,13 @@ def invoke(config: Config) -> None:
     server = config.server
     site_code = config.site_code
     mp_server = server  # Management point for AdminService (may differ from site server)
+
+    # Track infrastructure + probe results for OpenGraph output
+    infra = SCCMInfrastructure()
+    db_server = ""
+    db_signing_required: bool | None = None
+    site_server_signing_required: bool | None = None
+    epa_enforced: bool | None = None
 
     # --- Discovery phase ---
     if not server or not site_code:
@@ -141,6 +150,46 @@ def invoke(config: Config) -> None:
         if mp_server != server:
             print(f"Using management point: {mp_server}")
         print()
+
+    # --- SMB probes on discovered infrastructure ---
+    if server and infra.site_servers:
+        print(f"Probing site server {server} via SMB...")
+        try:
+            probe_result = probe_site_server(server, config.credentials)
+            if probe_result.reachable:
+                site_server_signing_required = probe_result.signing_required
+                print(f"  SMB signing: {'required' if probe_result.signing_required else 'NOT required'}")
+                if probe_result.db_server:
+                    db_server = probe_result.db_server
+                    print(f"  Site database server: {db_server}")
+
+                    # Check SMB signing on DB server too
+                    print(f"  Checking SMB signing on DB server {db_server}...")
+                    db_signing_required = check_smb_signing(db_server, config.credentials)
+                    if db_signing_required is not None:
+                        print(f"  DB SMB signing: {'required' if db_signing_required else 'NOT required'}")
+                        if not db_signing_required:
+                            print(f"  [!] TAKEOVER-2: SMB signing NOT required on DB server — NTLM relay possible")
+            else:
+                print(f"  SMB unreachable: {probe_result.error}")
+        except Exception as e:
+            logger.debug("SMB probe error: %s", e)
+
+    # --- EPA check (run early so results go into OpenGraph) ---
+    if config.check_epa or db_server:
+        try:
+            from sccmhound.checks.mssql_epa import EPAStatus, MSSQLEPAChecker
+            sql_target = config.sql_server or db_server or server
+            if sql_target:
+                print(f"Checking MSSQL EPA on {sql_target}:{config.sql_port}...")
+                checker = MSSQLEPAChecker(sql_target, config.sql_port)
+                epa_result = checker.check_epa()
+                epa_enforced = epa_result.status == EPAStatus.ENFORCED
+                print(f"  EPA Status: {epa_result.status.name} — {epa_result.details}")
+                if epa_result.status == EPAStatus.NOT_ENFORCED:
+                    print(f"  [!] TAKEOVER-1: EPA NOT enforced — NTLM relay to MSSQL possible")
+        except Exception as e:
+            logger.debug("EPA check error: %s", e)
 
     # --- Connection phase ---
     print(f"Connecting to {server} (sitecode: {site_code})")
@@ -310,17 +359,23 @@ def invoke(config: Config) -> None:
 
             loop_count += 1
 
-    # --- EPA check ---
-    if config.check_epa:
+    # --- OpenGraph output (SCCM attack paths for BloodHound CE) ---
+    if infra.site_servers or infra.management_points or infra.sites:
         try:
-            from sccmhound.checks.mssql_epa import MSSQLEPAChecker
-            sql_target = config.sql_server or server
-            print(f"Checking MSSQL EPA on {sql_target}:{config.sql_port}...")
-            checker = MSSQLEPAChecker(sql_target, config.sql_port)
-            result = checker.check_epa()
-            print(f"EPA Status: {result.status.name} — {result.details}")
+            print("Writing OpenGraph JSON (SCCM attack paths)...")
+            og_file = write_opengraph(
+                infra, computers, config.output_dir,
+                db_server=db_server,
+                db_signing_required=db_signing_required,
+                site_server_signing_required=site_server_signing_required,
+                epa_enforced=epa_enforced,
+            )
+            print(f"Wrote: {og_file}")
+            print("Import this file into BloodHound CE to visualize SCCM attack paths.")
         except Exception as e:
-            print(f"EPA check error: {e}")
+            print(f"OpenGraph write error: {e}")
+            if config.verbose:
+                logger.exception("OpenGraph error")
 
     # --- Cleanup ---
     try:
