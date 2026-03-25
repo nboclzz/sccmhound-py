@@ -1,0 +1,331 @@
+"""CLI entry point and main orchestration. Ported from src/SCCMHound.cs."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import time
+from datetime import datetime, timedelta
+
+from sccmhound.auth.credentials import Credentials
+from sccmhound.config import Config
+
+BANNER = r"""
+   ▄████████  ▄████████  ▄████████   ▄▄▄▄███▄▄▄▄      ▄█    █▄     ▄██████▄  ███    █▄  ███▄▄▄▄   ████████▄
+  ███    ███ ███    ███ ███    ███ ▄██▀▀▀███▀▀▀██▄   ███    ███   ███    ███ ███    ███ ███▀▀▀██▄ ███   ▀███
+  ███    █▀  ███    █▀  ███    █▀  ███   ███   ███   ███    ███   ███    ███ ███    ███ ███   ███ ███    ███
+  ███        ███        ███        ███   ███   ███  ▄███▄▄▄▄███▄▄ ███    ███ ███    ███ ███   ███ ███    ███
+▀███████████ ███        ███        ███   ███   ███ ▀▀███▀▀▀▀███▀  ███    ███ ███    ███ ███   ███ ███    ███
+         ███ ███    █▄  ███    █▄  ███   ███   ███   ███    ███   ███    ███ ███    ███ ███   ███ ███    ███
+   ▄█    ███ ███    ███ ███    ███ ███   ███   ███   ███    ███   ███    ███ ███    ███ ███   ███ ███   ▄███
+ ▄████████▀  ████████▀  ████████▀   ▀█   ███   █▀    ███    █▀     ▀██████▀  ████████▀   ▀█   █▀  ████████▀
+                                                                                              [Python Edition]
+"""
+
+logger = logging.getLogger("sccmhound")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sccmhound",
+        description="SCCMHound-py: BloodHound collector for Microsoft Configuration Manager",
+    )
+
+    parser.add_argument("--server", required=True, help="SCCM server hostname/IP")
+    parser.add_argument("--sitecode", required=True, help="SCCM site code")
+    parser.add_argument(
+        "-c", "--collectionmethods", default="Default",
+        choices=["Default", "LocalAdmins", "CurrentSessions", "All"],
+        help="Collection method (default: Default)",
+    )
+    parser.add_argument("--loop", action="store_true", help="Enable loop collection")
+    parser.add_argument("--loopduration", default="00:30:00", help="Loop duration HH:MM:SS (default: 00:30:00)")
+    parser.add_argument("--loopsleep", type=int, default=60, help="Sleep between loops in seconds (default: 60)")
+    parser.add_argument("--hc", action="store_true", help="Health check: test auth and exit")
+
+    auth = parser.add_argument_group("Authentication")
+    auth.add_argument("-u", "--username", help="Username")
+    auth.add_argument("-p", "--password", help="Password")
+    auth.add_argument("-d", "--domain", help="Domain")
+    auth.add_argument("-H", "--hash", dest="ntlm_hash", help="NTLM hash (LMHASH:NTHASH or :NTHASH)")
+    auth.add_argument("-k", "--kerberos", action="store_true", help="Use Kerberos authentication")
+    auth.add_argument("--ccache", help="Path to ccache file")
+    auth.add_argument("--dc-ip", help="Domain Controller IP for Kerberos")
+
+    checks = parser.add_argument_group("Security Checks")
+    checks.add_argument("--check-epa", action="store_true", help="Check MSSQL EPA/channel binding on site DB")
+    checks.add_argument("--sql-server", help="MSSQL server for EPA check (default: --server)")
+    checks.add_argument("--sql-port", type=int, default=1433, help="MSSQL port (default: 1433)")
+
+    parser.add_argument("-o", "--output-dir", default=".", help="Output directory for JSON files")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--debug", action="store_true", help="Debug output (implies verbose)")
+
+    return parser
+
+
+def _parse_duration(duration_str: str) -> timedelta:
+    """Parse HH:MM:SS into timedelta."""
+    parts = duration_str.split(":")
+    if len(parts) == 3:
+        return timedelta(hours=int(parts[0]), minutes=int(parts[1]), seconds=int(parts[2]))
+    return timedelta(minutes=30)
+
+
+def _setup_logging(verbose: bool, debug: bool) -> None:
+    level = logging.DEBUG if debug else (logging.INFO if verbose else logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def invoke(config: Config) -> None:
+    """Main orchestration — mirrors C# SCCMHound.invoke()."""
+    from sccmhound.collectors.adminservice_collector import AdminServiceCollector
+    from sccmhound.collectors.wmi_collector import WMICollector
+    from sccmhound.connectors.adminservice import AdminServiceConnector
+    from sccmhound.connectors.wmi import WMIConnector
+    from sccmhound.ldap.connection_manager import LdapConnectionManager
+    from sccmhound.ldap.sid_resolver import SIDResolver
+    from sccmhound.output import json_writer
+    from sccmhound.resolvers.domains import resolve_domains
+    from sccmhound.resolvers.local_admins import resolve_local_admins
+    from sccmhound.resolvers.sessions import resolve_sessions
+    from sccmhound.resolvers.users_groups import resolve_users_groups
+
+    cm = config.collection_methods.lower()
+
+    # --- Connection phase ---
+    print(f"Connecting to {config.server} (sitecode: {config.site_code})")
+    try:
+        print("Establishing WMI connection...")
+        wmi_connector = WMIConnector.create_instance(config.server, config.site_code, config.credentials)
+    except Exception as e:
+        print(f"Failed to establish WMI connection: {e}")
+        if config.verbose:
+            logger.exception("WMI connection error")
+        return
+
+    admin_connector = None
+    admin_collector = None
+    if cm in ("localadmins", "currentsessions", "all"):
+        try:
+            admin_connector = AdminServiceConnector.create_instance(config.server, config.credentials)
+            if admin_connector:
+                admin_collector = AdminServiceCollector(admin_connector)
+                if not admin_collector.get_collections():
+                    raise RuntimeError("Could not access SMS00001 collection")
+            else:
+                print("AdminService connection failed")
+                return
+        except PermissionError:
+            print("403 from AdminService API. Are you an SCCM Full Administrator?\nNote: DA != SCCM Full Administrator!")
+            return
+        except Exception as e:
+            print(f"AdminService connection error: {e}")
+            if config.verbose:
+                logger.exception("AdminService error")
+            return
+
+    # --- Health check ---
+    if config.health_check:
+        if wmi_connector.is_connected:
+            print(f"Connection to {config.server} (sitecode: {config.site_code}) established!")
+            print("Health check passed!")
+        else:
+            print("Health check failed.")
+        return
+
+    if not wmi_connector.is_connected:
+        print("WMI connector is not connected.")
+        return
+
+    print(f"Connection to {config.server} (sitecode: {config.site_code}) established!")
+    wmi_collector = WMICollector(wmi_connector)
+
+    # --- LDAP setup ---
+    ldap_mgr = LdapConnectionManager()
+    sid_resolver = SIDResolver(ldap_mgr, config.credentials)
+
+    # --- Collection phase ---
+    try:
+        print(f"Collecting computer objects from {config.site_code}...")
+        computers = wmi_collector.query_computers()
+        print(f"Collected {len(computers)} computers")
+
+        print(f"Collecting user objects from {config.site_code}...")
+        users = wmi_collector.query_users()
+        print(f"Collected {len(users)} users")
+
+        print(f"Collecting group objects from {config.site_code}...")
+        groups = wmi_collector.query_groups()
+        print(f"Collected {len(groups)} groups")
+
+        print(f"Collecting user-machine relationships from {config.site_code}...")
+        relationships = wmi_collector.query_user_machine_relationships()
+        print(f"Collected {len(relationships)} relationships")
+
+        if not any([computers, users, groups, relationships]):
+            print("No objects returned. Are you an SCCM Full Administrator?\nNote: DA != SCCM Full Administrator!")
+            return
+    except Exception as e:
+        print(f"Data collection error: {e}")
+        if config.verbose:
+            logger.exception("Collection error")
+        return
+
+    # --- Resolution phase ---
+    try:
+        print("Resolving domains...")
+        domains = resolve_domains(users, computers, groups)
+
+        print("Resolving user-group memberships...")
+        resolve_users_groups(users, groups)
+
+        print("Resolving sessions...")
+        resolve_sessions(computers, users, relationships, domains, sid_resolver)
+    except Exception as e:
+        print(f"Resolution error: {e}")
+        if config.verbose:
+            logger.exception("Resolution error")
+        return
+
+    # --- CMPivot collection ---
+    if cm in ("localadmins", "all") and admin_collector:
+        try:
+            print(f"Collecting local administrators via CMPivot...")
+            local_admins = admin_collector.get_administrators()
+            resolve_local_admins(computers, groups, users, local_admins, domains, sid_resolver)
+        except PermissionError as e:
+            print(f"Permission error: {e}")
+            return
+        except Exception as e:
+            print(f"Local admin collection error: {e}")
+            if config.verbose:
+                logger.exception("Local admin error")
+            return
+
+    if cm in ("currentsessions", "all") and admin_collector:
+        try:
+            print(f"Collecting current sessions via CMPivot...")
+            cmpivot_relationships = admin_collector.get_users()
+            resolve_sessions(computers, users, cmpivot_relationships, domains, sid_resolver)
+        except PermissionError as e:
+            print(f"Permission error: {e}")
+            return
+        except Exception as e:
+            print(f"CMPivot session collection error: {e}")
+            if config.verbose:
+                logger.exception("CMPivot session error")
+            return
+
+    # --- Output phase ---
+    try:
+        print("Writing JSON output...")
+        f1 = json_writer.write_computers(computers, config.output_dir)
+        f2 = json_writer.write_groups(groups, config.output_dir)
+        f3 = json_writer.write_users(users, config.output_dir)
+        f4 = json_writer.write_domains(domains, config.output_dir)
+        print(f"Wrote: {f1}, {f2}, {f3}, {f4}")
+    except Exception as e:
+        print(f"JSON write error: {e}")
+        if config.verbose:
+            logger.exception("JSON write error")
+        return
+
+    # --- Loop collection ---
+    if config.loop:
+        duration = _parse_duration(config.loop_duration)
+        end_time = datetime.now() + duration
+        loop_count = 1
+
+        print("Starting collection loops...")
+        while datetime.now() < end_time:
+            print(f"Sleeping for {config.loop_sleep} seconds...")
+            time.sleep(config.loop_sleep)
+
+            print(f"Loop iteration {loop_count}...")
+            try:
+                relationships = wmi_collector.query_user_machine_relationships()
+                resolve_sessions(computers, users, relationships, domains, sid_resolver)
+
+                if cm in ("currentsessions", "all") and admin_collector:
+                    cmpivot_rels = admin_collector.get_users()
+                    resolve_sessions(computers, users, cmpivot_rels, domains, sid_resolver)
+
+                json_writer.write_sessions(computers, config.output_dir)
+            except Exception as e:
+                print(f"Loop error: {e}")
+                if config.verbose:
+                    logger.exception("Loop error")
+                break
+
+            loop_count += 1
+
+    # --- EPA check ---
+    if config.check_epa:
+        try:
+            from sccmhound.checks.mssql_epa import MSSQLEPAChecker
+            sql_target = config.sql_server or config.server
+            print(f"Checking MSSQL EPA on {sql_target}:{config.sql_port}...")
+            checker = MSSQLEPAChecker(sql_target, config.sql_port)
+            result = checker.check_epa()
+            print(f"EPA Status: {result.status.name} — {result.details}")
+        except Exception as e:
+            print(f"EPA check error: {e}")
+
+    # --- Cleanup ---
+    try:
+        LdapConnectionManager().cleanup()
+    except Exception:
+        pass
+
+    wmi_connector.disconnect()
+    print("Hound out!")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    _setup_logging(args.verbose, args.debug)
+    print(BANNER)
+
+    # Validate credentials
+    cred_flags = [args.username, args.password, args.domain]
+    if any(cred_flags) and not all(cred_flags):
+        if not (args.ntlm_hash or args.kerberos or args.ccache):
+            print("Error: specify -u, -p, and -d together, or use -H/--hash, -k/--kerberos, or --ccache")
+            sys.exit(1)
+
+    credentials = Credentials(
+        username=args.username or "",
+        password=args.password or "",
+        domain=args.domain or "",
+        ntlm_hash=args.ntlm_hash or "",
+        kerberos=args.kerberos,
+        ccache=args.ccache or "",
+        dc_ip=args.dc_ip,
+    )
+
+    config = Config(
+        server=args.server,
+        site_code=args.sitecode,
+        collection_methods=args.collectionmethods,
+        loop=args.loop,
+        loop_duration=args.loopduration,
+        loop_sleep=args.loopsleep,
+        health_check=args.hc,
+        credentials=credentials,
+        verbose=args.verbose or args.debug,
+        debug=args.debug,
+        output_dir=args.output_dir,
+        check_epa=args.check_epa,
+        sql_server=args.sql_server,
+        sql_port=args.sql_port,
+    )
+
+    invoke(config)
