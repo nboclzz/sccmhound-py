@@ -1,4 +1,4 @@
-"""CLI entry point and main orchestration. Ported from src/SCCMHound.cs."""
+"""CLI entry point and main orchestration."""
 
 from __future__ import annotations
 
@@ -32,30 +32,33 @@ def build_parser() -> argparse.ArgumentParser:
         description="SCCMHound-py: BloodHound collector for Microsoft Configuration Manager",
     )
 
-    parser.add_argument("--server", required=True, help="SCCM server hostname/IP")
-    parser.add_argument("--sitecode", required=True, help="SCCM site code")
-    parser.add_argument(
+    target = parser.add_argument_group("Target")
+    target.add_argument("-d", "--domain", required=True, help="Target domain (e.g. CORP.LOCAL)")
+    target.add_argument("--dc-ip", help="Domain Controller IP (if omitted, domain name is used for DNS)")
+    target.add_argument("--server", help="SCCM server override (skip auto-discovery)")
+    target.add_argument("--sitecode", help="SCCM site code override (skip auto-discovery)")
+
+    collection = parser.add_argument_group("Collection")
+    collection.add_argument(
         "-c", "--collectionmethods", default="Default",
         choices=["Default", "LocalAdmins", "CurrentSessions", "All"],
         help="Collection method (default: Default)",
     )
-    parser.add_argument("--loop", action="store_true", help="Enable loop collection")
-    parser.add_argument("--loopduration", default="00:30:00", help="Loop duration HH:MM:SS (default: 00:30:00)")
-    parser.add_argument("--loopsleep", type=int, default=60, help="Sleep between loops in seconds (default: 60)")
-    parser.add_argument("--hc", action="store_true", help="Health check: test auth and exit")
+    collection.add_argument("--loop", action="store_true", help="Enable loop collection")
+    collection.add_argument("--loopduration", default="00:30:00", help="Loop duration HH:MM:SS (default: 00:30:00)")
+    collection.add_argument("--loopsleep", type=int, default=60, help="Sleep between loops in seconds (default: 60)")
+    collection.add_argument("--hc", action="store_true", help="Health check: test auth and exit")
 
     auth = parser.add_argument_group("Authentication")
     auth.add_argument("-u", "--username", help="Username")
     auth.add_argument("-p", "--password", help="Password")
-    auth.add_argument("-d", "--domain", help="Domain")
     auth.add_argument("-H", "--hash", dest="ntlm_hash", help="NTLM hash (LMHASH:NTHASH or :NTHASH)")
     auth.add_argument("-k", "--kerberos", action="store_true", help="Use Kerberos authentication")
     auth.add_argument("--ccache", help="Path to ccache file")
-    auth.add_argument("--dc-ip", help="Domain Controller IP for Kerberos")
 
     checks = parser.add_argument_group("Security Checks")
     checks.add_argument("--check-epa", action="store_true", help="Check MSSQL EPA/channel binding on site DB")
-    checks.add_argument("--sql-server", help="MSSQL server for EPA check (default: --server)")
+    checks.add_argument("--sql-server", help="MSSQL server for EPA check (auto-discovered if omitted)")
     checks.add_argument("--sql-port", type=int, default=1433, help="MSSQL port (default: 1433)")
 
     parser.add_argument("-o", "--output-dir", default=".", help="Output directory for JSON files")
@@ -66,7 +69,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _parse_duration(duration_str: str) -> timedelta:
-    """Parse HH:MM:SS into timedelta."""
     parts = duration_str.split(":")
     if len(parts) == 3:
         return timedelta(hours=int(parts[0]), minutes=int(parts[1]), seconds=int(parts[2]))
@@ -83,11 +85,12 @@ def _setup_logging(verbose: bool, debug: bool) -> None:
 
 
 def invoke(config: Config) -> None:
-    """Main orchestration — mirrors C# SCCMHound.invoke()."""
+    """Main orchestration with auto-discovery."""
     from sccmhound.collectors.adminservice_collector import AdminServiceCollector
     from sccmhound.collectors.wmi_collector import WMICollector
     from sccmhound.connectors.adminservice import AdminServiceConnector
     from sccmhound.connectors.wmi import WMIConnector
+    from sccmhound.discovery.ldap_discovery import discover_sccm
     from sccmhound.ldap.connection_manager import LdapConnectionManager
     from sccmhound.ldap.sid_resolver import SIDResolver
     from sccmhound.output import json_writer
@@ -97,12 +100,53 @@ def invoke(config: Config) -> None:
     from sccmhound.resolvers.users_groups import resolve_users_groups
 
     cm = config.collection_methods.lower()
+    server = config.server
+    site_code = config.site_code
+    mp_server = server  # Management point for AdminService (may differ from site server)
+
+    # --- Discovery phase ---
+    if not server or not site_code:
+        print(f"Discovering SCCM infrastructure in {config.credentials.domain}...")
+        try:
+            infra = discover_sccm(config.credentials, dc_ip=config.credentials.dc_ip)
+        except Exception as e:
+            print(f"Discovery failed: {e}")
+            if config.verbose:
+                logger.exception("Discovery error")
+            return
+
+        if not infra.primary_server and not infra.primary_site_code:
+            print("No SCCM infrastructure found in this domain.")
+            return
+
+        print(f"\nDiscovered SCCM infrastructure:")
+        print(infra.summary())
+        print()
+
+        # Use discovered values if not explicitly overridden
+        if not server:
+            server = infra.primary_server
+        if not site_code:
+            site_code = infra.primary_site_code
+        if infra.primary_mp:
+            mp_server = infra.primary_mp
+
+        if not server or not site_code:
+            print("Could not determine SCCM server or site code from discovery.")
+            print("Use --server and --sitecode to specify manually.")
+            return
+
+        print(f"Using site server: {server}")
+        print(f"Using site code: {site_code}")
+        if mp_server != server:
+            print(f"Using management point: {mp_server}")
+        print()
 
     # --- Connection phase ---
-    print(f"Connecting to {config.server} (sitecode: {config.site_code})")
+    print(f"Connecting to {server} (sitecode: {site_code})")
     try:
         print("Establishing WMI connection...")
-        wmi_connector = WMIConnector.create_instance(config.server, config.site_code, config.credentials)
+        wmi_connector = WMIConnector.create_instance(server, site_code, config.credentials)
     except Exception as e:
         print(f"Failed to establish WMI connection: {e}")
         if config.verbose:
@@ -113,7 +157,8 @@ def invoke(config: Config) -> None:
     admin_collector = None
     if cm in ("localadmins", "currentsessions", "all"):
         try:
-            admin_connector = AdminServiceConnector.create_instance(config.server, config.credentials)
+            admin_target = mp_server or server
+            admin_connector = AdminServiceConnector.create_instance(admin_target, config.credentials)
             if admin_connector:
                 admin_collector = AdminServiceCollector(admin_connector)
                 if not admin_collector.get_collections():
@@ -133,7 +178,7 @@ def invoke(config: Config) -> None:
     # --- Health check ---
     if config.health_check:
         if wmi_connector.is_connected:
-            print(f"Connection to {config.server} (sitecode: {config.site_code}) established!")
+            print(f"Connection to {server} (sitecode: {site_code}) established!")
             print("Health check passed!")
         else:
             print("Health check failed.")
@@ -143,7 +188,7 @@ def invoke(config: Config) -> None:
         print("WMI connector is not connected.")
         return
 
-    print(f"Connection to {config.server} (sitecode: {config.site_code}) established!")
+    print(f"Connection to {server} (sitecode: {site_code}) established!")
     wmi_collector = WMICollector(wmi_connector)
 
     # --- LDAP setup ---
@@ -152,24 +197,24 @@ def invoke(config: Config) -> None:
 
     # --- Collection phase ---
     try:
-        print(f"Collecting computer objects from {config.site_code}...")
+        print(f"Collecting computer objects from {site_code}...")
         computers = wmi_collector.query_computers()
         print(f"Collected {len(computers)} computers")
 
-        print(f"Collecting user objects from {config.site_code}...")
+        print(f"Collecting user objects from {site_code}...")
         users = wmi_collector.query_users()
         print(f"Collected {len(users)} users")
 
-        print(f"Collecting group objects from {config.site_code}...")
+        print(f"Collecting group objects from {site_code}...")
         groups = wmi_collector.query_groups()
         print(f"Collected {len(groups)} groups")
 
-        print(f"Collecting user-machine relationships from {config.site_code}...")
+        print(f"Collecting user-machine relationships from {site_code}...")
         relationships = wmi_collector.query_user_machine_relationships()
         print(f"Collected {len(relationships)} relationships")
 
         if not any([computers, users, groups, relationships]):
-            print("No objects returned. Are you an SCCM Full Administrator?\nNote: DA != SCCM Full Administrator!")
+            print("No objects returned. Check that your account has sufficient SCCM access.")
             return
     except Exception as e:
         print(f"Data collection error: {e}")
@@ -196,7 +241,7 @@ def invoke(config: Config) -> None:
     # --- CMPivot collection ---
     if cm in ("localadmins", "all") and admin_collector:
         try:
-            print(f"Collecting local administrators via CMPivot...")
+            print("Collecting local administrators via CMPivot...")
             local_admins = admin_collector.get_administrators()
             resolve_local_admins(computers, groups, users, local_admins, domains, sid_resolver)
         except PermissionError as e:
@@ -210,7 +255,7 @@ def invoke(config: Config) -> None:
 
     if cm in ("currentsessions", "all") and admin_collector:
         try:
-            print(f"Collecting current sessions via CMPivot...")
+            print("Collecting current sessions via CMPivot...")
             cmpivot_relationships = admin_collector.get_users()
             resolve_sessions(computers, users, cmpivot_relationships, domains, sid_resolver)
         except PermissionError as e:
@@ -269,7 +314,7 @@ def invoke(config: Config) -> None:
     if config.check_epa:
         try:
             from sccmhound.checks.mssql_epa import MSSQLEPAChecker
-            sql_target = config.sql_server or config.server
+            sql_target = config.sql_server or server
             print(f"Checking MSSQL EPA on {sql_target}:{config.sql_port}...")
             checker = MSSQLEPAChecker(sql_target, config.sql_port)
             result = checker.check_epa()
@@ -294,17 +339,19 @@ def main() -> None:
     _setup_logging(args.verbose, args.debug)
     print(BANNER)
 
-    # Validate credentials
-    cred_flags = [args.username, args.password, args.domain]
-    if any(cred_flags) and not all(cred_flags):
-        if not (args.ntlm_hash or args.kerberos or args.ccache):
-            print("Error: specify -u, -p, and -d together, or use -H/--hash, -k/--kerberos, or --ccache")
-            sys.exit(1)
+    # Validate credentials — need at least one auth method
+    has_password = args.username and args.password
+    has_hash = args.ntlm_hash
+    has_kerberos = args.kerberos or args.ccache
+
+    if not has_password and not has_hash and not has_kerberos:
+        print("Error: provide credentials via -u/-p, -H (hash), -k (kerberos), or --ccache")
+        sys.exit(1)
 
     credentials = Credentials(
         username=args.username or "",
         password=args.password or "",
-        domain=args.domain or "",
+        domain=args.domain,
         ntlm_hash=args.ntlm_hash or "",
         kerberos=args.kerberos,
         ccache=args.ccache or "",
@@ -312,8 +359,8 @@ def main() -> None:
     )
 
     config = Config(
-        server=args.server,
-        site_code=args.sitecode,
+        server=args.server or "",
+        site_code=args.sitecode or "",
         collection_methods=args.collectionmethods,
         loop=args.loop,
         loop_duration=args.loopduration,
